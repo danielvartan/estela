@@ -1,0 +1,56 @@
+editor: source
+
+execute:
+  cache: false
+  freeze: false
+
+project:
+  type: website
+  output-dir: docs
+  render: [index.qmd]
+
+title: "SISVAN 2019"
+author: "Daniel Vartanian"
+  # name: "Daniel Vartanian"
+  # orcid: 0000-0001-7782-759X
+  # url: https://linktr.ee/danielvartan
+  # email: danvartan@gmail.com
+  # corresponding: true
+  # affiliation:
+  #   - name: University of São Paulo
+  #   - Country: Brazil
+  #   - url: https://www.usp.br
+keyword: >
+  data science. data visualization. child health. child-nutrition. malnutrition.
+  nutritional-epidemiology. global-syndemic. unified-health-system. brazil.
+date: today
+date-format: "YYYY-MM-DD"
+
+website:
+  repo-url: https://github.com/danielvartan/estela/
+  site-url: https://danielvartan.github.io/estela/
+  issue-url: https://github.com/danielvartan/estela/issues/
+  repo-branch: main
+  repo-actions: [edit, issue]
+  search: false
+  navbar:
+    title: false
+    background: dark
+    left:
+      - icon: github
+        href: https://github.com/danielvartan/estela
+        aria-label: GitHub
+
+format:
+  html:
+    locale: en
+    language: en-us
+    code-fold: show
+    code-link: true
+    tbl-cap-location: top
+    callout-appearance: simple
+    csl: csl/english-apa-author-date.csl
+    theme: [cosmo, scss/web.scss]
+
+google-scholar: false
+bibliography: references.bib

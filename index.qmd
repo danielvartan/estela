@@ -1,0 +1,789 @@
+---
+title: "SISVAN 2019"
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+source(here::here("R/quarto-setup.R"))
+```
+
+<!-- badges: start -->
+[![Project Status: Inactive – The project has reached a stable, usable state but is no longer being actively developed; support/maintenance will be provided as time allows.](https://www.repostatus.org/badges/latest/inactive.svg)](https://www.repostatus.org/#inactive)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](https://choosealicense.com/licenses/mit/)
+<!-- badges: end -->
+
+## Overview
+
+This analysis focused on plotting data related to the food consumption of Brazilian children aged 2 to 4 years, as monitored by Brazil's Food and Nutrition Surveillance System ([SISVAN](https://sisaps.saude.gov.br/sisvan/)) in 2019.
+
+## Setting things up
+
+```{r}
+#| eval: false
+#| output: false
+
+library(checkmate, quietly = TRUE)
+library(colorspace, quietly = TRUE)
+library(dplyr, quietly = TRUE)
+library(geobr, quietly = TRUE)
+library(ggplot2, quietly = TRUE)
+library(googlesheets4, quietly = TRUE)
+library(grDevices, quietly = TRUE)
+library(here, quietly = TRUE)
+library(raster, quietly = TRUE)
+library(RColorBrewer, quietly = TRUE)
+library(rutils, quietly = TRUE) # danielvartan/rutils (GitHub)
+library(terra, quietly = TRUE)
+library(tidyr, quietly = TRUE)
+library(tidyterra, quietly = TRUE)
+library(sf, quietly = TRUE)
+library(spatstat.geom, quietly = TRUE)
+library(stringdist, quietly = TRUE)
+library(stringr, quietly = TRUE)
+library(viridis, quietly = TRUE)
+```
+
+```{r}
+get_data <- function(
+    sheet,
+    ss = "1nnDzHKufJGujXiuCFb6Hj14k0HIt6JPV0Y2wnqa2eAc",
+    sheet_ignore = c("Documentation", "Codebook", "Validation", "Template")
+    ) {
+  checkmate::assert_string(sheet)
+  checkmate::assert_string(ss)
+  checkmate::assert_character(sheet_ignore)
+  rutils:::assert_internet()
+
+  ss <- googlesheets4::gs4_get(ss)
+  sheets <- ss$sheets$name[!ss$sheets$name %in% sheet_ignore]
+  checkmate::assert_subset(sheet, sheets)
+
+  if (!sheet == "City validation") {
+    cities <- googlesheets4::read_sheet(
+      ss = ss, 
+      sheet = "City validation", 
+      col_names = TRUE,
+      col_types = "c",
+      na = c("", "NA"), 
+      trim_ws = TRUE, 
+      skip = 0
+    ) |> 
+      magrittr::extract2("value")
+  }
+  
+  out <- googlesheets4::read_sheet(
+      ss = ss, 
+      sheet = sheet, 
+      col_names = TRUE, 
+      col_types = "c",
+      na = c("", "NA"), 
+      trim_ws = TRUE, 
+      skip = 0
+    )
+  
+  if (!sheet == "City validation") {
+    out |> 
+      dplyr::mutate(n = as.integer(n)) |>
+      dplyr::filter(!n == 0)
+  } else {
+    out
+  }
+}
+```
+
+```{r}
+assert_color <- function(color, null_ok = FALSE, na_ok = FALSE) {
+  color_pattern <- "(?i)^#[a-f0-9]{3}$|^#[a-f0-9]{6}$|^transparent$"
+  
+  checkmate::assert_flag(null_ok)
+  checkmate::assert_flag(na_ok)
+  
+  name <- deparse(substitute(color))
+  
+  if (is.null(color) && isFALSE(null_ok)) {
+    cli::cli_abort(
+      paste0(
+        "{.strong {cli::col_red(name)}} cannot be {.strong NULL}."
+      )
+    )
+  }
+  
+  if (!is.null(color)) {
+    if (is.na(color) && isFALSE(na_ok)) {
+      cli::cli_abort(
+        paste0(
+          "{.strong {cli::col_red(name)}} cannot be {.strong NA}."
+        )
+      )
+    }
+  }
+  
+  if (!is.null(color) && !is.na(color) &&
+      !color %in% grDevices::colors() && 
+      !checkmate::test_string(color, pattern = color_pattern)) {
+    cli::cli_abort(
+      paste0(
+        "{.strong {cli::col_red(name)}} is not a valid color code. ",
+        "It must contain a hexadecimal color code or one of the ",
+        "values in {.strong {cli::col_blue('grDevices::color()')}}."
+      )
+    )
+  }
+
+  invisible(NULL)
+}
+```
+
+
+```{r}
+assert_color_options <- function(
+    color_low = NULL, color_high = NULL, viridis = NULL
+  ) {
+  viridis_choices <- c(
+    "magma", "A", "inferno", "B", "plasma", "C", "viridis", "D",
+    "cividis", "E", "rocket", "F", "mako", "G", "turbo", "H"
+  )
+  
+  color_pattern <- "(?i)^#[a-f0-9]{6}$"
+  
+  checkmate::assert_string(color_low, pattern = color_pattern, null.ok = TRUE)
+  checkmate::assert_string(color_high, pattern = color_pattern, null.ok = TRUE)
+  checkmate::assert_choice(viridis, viridis_choices, null.ok = TRUE)
+  
+  if (is.null(color_low) && !is.null(color_high) ||
+      !is.null(color_low) && is.null(color_high)) {
+    cli::cli_abort(
+      paste0(
+        "You must provide both ", 
+        "{.strong {cli::col_blue('color_low')}} and ",
+        "{.strong {cli::col_red('color_high')}} ",
+        "arguments at the same time."
+      )
+    )
+  } else if ((!is.null(color_low) | !is.null(color_high)) && 
+             !is.null(viridis)) {
+    cli::cli_abort(
+      paste0(
+        "You can't use both ", 
+        "{.strong {cli::col_blue('color_low/color_high')}} and ",
+        "{.strong {cli::col_red('viridis')}} ",
+        "arguments at the same time."
+      )
+    )
+  } else {
+    invisible(NULL)
+  }
+}
+```
+
+```{r}
+add_viridis <- function(
+    plot, 
+    option, 
+    color_na = NULL, 
+    binned = FALSE,
+    breaks = ggplot2::waiver(),
+    point = FALSE
+  ) {
+  option_choices <- c(
+    "magma", "A", "inferno", "B", "plasma", "C", "viridis", "D",
+    "cividis", "E", "rocket", "F", "mako", "G", "turbo", "H"
+  )
+  
+  checkmate::assert_class(plot, "gg")
+  checkmate::assert_choice(option, option_choices, null.ok = TRUE)
+  assert_color(color_na, null_ok = TRUE)
+  checkmate::assert_flag(binned)
+  checkmate::assert_multi_class(breaks, c("waiver", "numeric"))
+  checkmate::assert_flag(point)
+  
+  if (isTRUE(point)) {
+    plot + 
+      viridis::scale_color_viridis(
+        option = option,
+        na.value = color_na,
+        breaks = breaks
+      )
+  } else if (isTRUE(binned)) {
+    plot +
+      ggplot2::scale_fill_binned(
+        type = "viridis",
+        na.value = color_na,
+        breaks = breaks
+      )
+  } else {
+    plot + 
+      viridis::scale_fill_viridis(
+        option = option,
+        na.value = color_na,
+        breaks = breaks
+      )
+  }
+}
+```
+
+```{r}
+add_fill <- function(
+    plot, 
+    color_low, 
+    color_high, 
+    color_na = NULL,
+    binned = FALSE,
+    breaks = ggplot2::waiver(),
+    point = FALSE
+) {
+  checkmate::assert_class(plot, "gg")
+  assert_color(color_low, null_ok = TRUE)
+  assert_color(color_high, null_ok = TRUE)
+  assert_color(color_na, null_ok = TRUE)
+  checkmate::assert_flag(binned)
+  checkmate::assert_multi_class(breaks, c("waiver", "numeric"))
+  checkmate::assert_flag(point)
+  
+  if (isTRUE(point)) {
+    plot + 
+      ggplot2::scale_color_continuous(
+        low = color_low, 
+        high = color_high,
+        na.value = color_na,
+        breaks = breaks
+      )
+  } else if (isTRUE(binned)) {
+    plot + 
+      ggplot2::scale_fill_binned(
+        type = "gradient",
+        low = color_low,
+        high = color_high,
+        na.value = color_na,
+        breaks = breaks
+      )
+  } else {
+    plot + 
+      ggplot2::scale_fill_gradient(
+        low = color_low, 
+        high = color_high,
+        na.value = color_na,
+        breaks = breaks
+      )
+  }
+}
+```
+
+```{r}
+add_theme <- function(plot, theme) {
+  theme_choices <- c("minimal", "void")
+  
+  checkmate::assert_class(plot, "gg")
+  checkmate::assert_choice(theme, theme_choices, null.ok = TRUE)
+  
+  if (theme == "minimal") {
+    plot + ggplot2::theme_minimal()
+  } else if (theme == "void") {
+    plot + ggplot2::theme_void()
+  } else {
+    invisible(NULL)
+  }
+}
+```
+
+```{r}
+plot_sf <- function(data, color_border = NA) {
+  checkmate::assert_data_frame(data)
+  checkmate::assert_subset(c("abbrev_state", "name_muni", "n"), names(data))
+  assert_color(color_border, na_ok = TRUE)
+  
+  data |>
+    ggplot2::ggplot() +
+    ggplot2::geom_sf(
+      ggplot2::aes(fill = n),
+      color = color_border
+    )
+}
+```
+
+```{r}
+plot_raster <- function(
+    data, 
+    color_na = "white", 
+    color_border = "black",
+    breaks = ggplot2::waiver()
+  ) {
+  checkmate::assert_data_frame(data)
+  checkmate::assert_subset(c("abbrev_state", "name_muni", "n"), names(data))
+  assert_color(color_na, null_ok = TRUE)
+  assert_color(color_border, na_ok = TRUE)
+  checkmate::assert_multi_class(breaks, c("waiver", "numeric"))
+  rutils:::assert_internet()
+  
+  res <- as.data.frame(do.call(
+    "rbind", 
+    lapply(sf::st_geometry(data), sf::st_bbox))
+  )
+  
+  data_points <- data |> sf::st_centroid() |> rutils:::shush()
+  
+  data_points <- dplyr::tibble(
+    lon = sf::st_coordinates(data_points)[, 1],
+    lat = sf::st_coordinates(data_points)[, 2],
+    n = data$n
+  ) |>
+    # tidyr::drop_na() |>
+    dplyr::mutate(
+      n = dplyr::if_else(n == 0, NA, n),
+      order = rank(n, ties.method = "first")
+    ) |>
+    dplyr::arrange(order)
+  
+  ras_dom <- raster::raster(
+    xmn = min(res[["xmin"]]),
+    xmx = max(res[["xmax"]]),
+    ymn = min(res[["ymin"]]),
+    ymx = max(res[["ymax"]]),
+    resolution = 0.25,
+    crs = sf::st_crs(data)
+  )
+  
+  sp::coordinates(data_points) <- ~ lon + lat
+  data_raster <- 
+    data_points |> 
+    raster::rasterize(ras_dom, "n", update = TRUE) |>
+    terra::rast()
+  
+  geobr_data_br <- 
+    geobr::read_country(year = 2019, showProgress = FALSE) |>
+    rutils:::shush()
+  
+  plot <- data |>
+    ggplot2::ggplot() +
+    ggplot2::geom_sf(
+      data = geobr_data_br,
+      fill = "transparent", # "white"
+      color = color_border
+    ) + 
+    tidyterra::geom_spatraster(
+      data = data_raster
+    ) +
+    ggplot2::geom_sf(
+      data = geobr_data_br,
+      fill = "transparent",
+      color = color_border
+    )
+  
+  plot |> add_viridis(option = "plasma", "transparent", FALSE, breaks, FALSE)
+}
+```
+
+```{r}
+plot_point <- function(
+    data, 
+    color_na = "white", 
+    color_border = "white",
+    breaks = ggplot2::waiver(),
+    alpha = 0.7
+  ) {
+  checkmate::assert_data_frame(data)
+  checkmate::assert_subset(c("abbrev_state", "name_muni", "n"), names(data))
+  assert_color(color_na, null_ok = TRUE)
+  assert_color(color_border, na_ok = TRUE)
+  checkmate::assert_multi_class(breaks, c("waiver", "numeric"))
+  checkmate::assert_number(alpha, lower = 0, upper = 1)
+  rutils:::assert_internet()
+  
+  data_points <- data |> sf::st_centroid() |> rutils:::shush()
+  
+  data_points <- dplyr::tibble(
+    lon = sf::st_coordinates(data_points)[, 1],
+    lat = sf::st_coordinates(data_points)[, 2],
+    n = data$n,
+    order = rank(n, ties.method = "first")
+  ) |>
+    tidyr::drop_na() |>
+    dplyr::arrange(order)
+  
+  geobr_data_br <- 
+    geobr::read_country(year = 2019, showProgress = FALSE) |>
+    rutils:::shush()
+  
+  data |>
+    ggplot2::ggplot() +
+    ggplot2::geom_sf(
+      data = geobr_data_br,
+      fill = color_na, # "transparent"
+      color = color_border
+    ) +
+    ggplot2::geom_point(
+      data = data_points,
+      mapping = ggplot2::aes(
+        x = lon, 
+        y = lat, 
+        size = n, 
+        color = n
+      ),
+      alpha = alpha
+    ) +
+    ggplot2::guides(
+      color = ggplot2::guide_legend(), 
+      size = ggplot2::guide_legend(),
+    ) +
+    ggplot2::scale_size_continuous(
+      range = c(0, 5),
+      breaks = breaks
+    ) +
+    ggplot2::theme(legend.key = ggplot2::element_blank())
+}
+```
+
+```{r}
+plot_brazil_city_map <- function(
+    data, 
+    color_low = NULL,
+    color_high = NULL,
+    color_na = "white",
+    color_border = NA,
+    viridis = NULL,
+    binned = TRUE,
+    breaks = NULL,
+    zero_na = FALSE,
+    point = FALSE,
+    alpha = 0.7,
+    density = FALSE,
+    text_size = NULL,
+    theme = NULL
+  ) {
+  viridis_choices <- c(
+    "magma", "A", "inferno", "B", "plasma", "C", "viridis", "D",
+    "cividis", "E", "rocket", "F", "mako", "G", "turbo", "H"
+  )
+  
+  theme_choices <- c("minimal", "void")
+  
+  checkmate::assert_tibble(data)
+  checkmate::assert_subset(c("abbrev_state", "name_muni", "n"), names(data))
+  assert_color(color_low, null_ok = TRUE)
+  assert_color(color_high, null_ok = TRUE)
+  assert_color(color_na, null_ok = TRUE)
+  assert_color(color_border, na_ok = TRUE)
+  checkmate::assert_choice(viridis, viridis_choices, null.ok = TRUE)
+  checkmate::assert_flag(binned)
+  checkmate::assert_multi_class(breaks, c("waiver", "numeric"), null.ok = TRUE)
+  checkmate::assert_flag(zero_na)
+  checkmate::assert_flag(point)
+  checkmate::assert_number(alpha, lower = 0, upper = 1)
+  checkmate::assert_flag(density)
+  checkmate::assert_number(text_size, null.ok = TRUE)
+  checkmate::assert_choice(theme, theme_choices, null.ok = TRUE)
+  assert_color_options(color_low, color_high, viridis)
+  rutils:::assert_internet()
+    
+  geobr_data <-
+      geobr::read_municipality(year = 2019, showProgress = FALSE) |>
+      rutils:::shush()
+
+  if (is.null(color_low) || is.null(color_high)) {
+    colors <- RColorBrewer::brewer.pal(5,"YlOrRd")
+    color_low <- dplyr::first(colors) # "#ffebd6"
+    color_high <- dplyr::last(colors) # "#A90F06"
+  }
+  
+  data <- 
+    geobr_data |>
+    dplyr::left_join(data, by = c("abbrev_state", "name_muni"))
+  
+  if (isTRUE(zero_na)) {
+    data <- data |> dplyr::mutate(n = ifelse(is.na(n), 0, n))
+  }
+  
+  if (is.null(breaks)) {
+    # breaks <- c(0, 250, 500, 750, 1000)
+    
+    breaks <- seq(
+      signif(max(data$n, na.rm = TRUE) / 5, 1), 
+      max(data$n, na.rm = TRUE), 
+      by = signif(max(data$n, na.rm = TRUE) / 5, 1)
+    ) |> 
+      signif(1)
+  }
+  
+  if (isTRUE(density)) {
+    # Not implemented.
+    # plot <- data |> plot_raster(color_na, color_border, breaks)
+  } else if (isTRUE(point)) {
+    plot <- data |> plot_point(color_na, color_border, breaks, alpha)
+  } else {
+    plot <- data |> plot_sf(color_border)
+  }
+  
+  plot <- 
+    plot +
+    ggplot2::labs(
+      x = "Longitude", 
+      y = "Latitude",
+      color = "Total",
+      fill = "Total",
+      size = "Total"
+    ) +
+    ggplot2::theme(text = ggplot2::element_text(size = text_size))
+
+  if (is.null(viridis)) {
+    plot <- 
+      plot |> 
+      add_fill(color_low, color_high, color_na, binned, breaks, point)
+  } else {
+    plot <- plot |> add_viridis(viridis, color_na, binned, breaks, point)
+  }
+
+  if (!is.null(theme)) plot <- plot |> add_theme(theme)
+  
+  print(plot)
+  invisible(plot)
+}
+```
+
+<!-- Validate city values (SISVAN versus `geobr`) -->
+
+```{r}
+#| eval: false
+#| include: false
+
+geobr_data <- geobr::read_municipality(year = 2019, showProgress = FALSE)
+```
+
+```{r}
+#| eval: false
+#| include: false
+
+# Create a 'Temp' sheet before using this function.
+
+googlesheets4::range_write(
+  ss = "1nnDzHKufJGujXiuCFb6Hj14k0HIt6JPV0Y2wnqa2eAc",
+  dplyr::tibble(value = geobr_data$name_muni),
+  sheet = "Temp",
+  range = "A1",
+  col_names = FALSE,
+  reformat = FALSE
+)
+```
+
+```{r}
+#| eval: false
+#| include: false
+
+data <- get_data("City validation")
+```
+
+```{r}
+#| eval: false
+#| include: false
+
+match <- stringdist::amatch(
+  paste0(tolower(data$key_abbrev_state), tolower(data$key)), 
+  paste0(geobr_data$abbrev_state, geobr_data$name_muni) |> 
+    tolower() |>
+    iconv(from = 'UTF-8', to = 'ASCII//TRANSLIT'), 
+  maxDist = 1
+)
+
+paired_data <- 
+  data |>
+  dplyr::mutate(
+    value_uf = geobr_data$abbrev_state[match],
+    value = geobr_data$name_muni[match]
+  )|>
+  dplyr::select(key_uf, key, value_uf, value)
+```
+
+```{r}
+#| eval: false
+#| include: false
+
+googlesheets4::range_write(
+  ss = "1nnDzHKufJGujXiuCFb6Hj14k0HIt6JPV0Y2wnqa2eAc",
+  paired_data,
+  sheet = "City validation",
+  range = "A2",
+  col_names = FALSE,
+  reformat = FALSE
+)
+```
+
+```{r}
+breaks <- c(250, 500, 750, 1000)
+```
+
+```{r}
+#| eval: false
+#| include: false
+
+data_dir <- here::here("data")
+```
+
+
+## Habit of having at least the three main meals of the day
+
+```{r}
+data <- get_data("Habits - Meals")
+```
+
+```{r}
+#| eval: false
+#| inclued: false
+
+if (checkmate::test_tibble(data)) {
+  saveRDS(data, file.path(data_dir, "habits_meals.rds"))
+}
+```
+
+
+```{r}
+data |> plot_brazil_city_map(breaks = breaks)
+```
+
+### Alternatives
+
+```{r}
+data |> plot_brazil_city_map(binned = FALSE)
+```
+
+```{r}
+data |> plot_brazil_city_map(point = TRUE, breaks = breaks, alpha = 0.5)
+```
+
+```{r}
+data |> plot_brazil_city_map(
+  color_na = "gray95",
+  breaks = breaks, 
+  theme = "void"
+)
+```
+
+```{r}
+data |> plot_brazil_city_map(viridis = "plasma", binned = FALSE)
+```
+
+```{r}
+#| eval: false
+#| include: false
+
+data |> plot_brazil_city_map(density = TRUE, viridis = "plasma")
+```
+
+## Habit of having meals while watching television
+
+```{r}
+data <- get_data("Habits - TV")
+```
+
+```{r}
+#| eval: false
+#| inclued: false
+
+if (checkmate::test_tibble(data)) {
+  saveRDS(data, file.path(data_dir, "habits_tv.rds"))
+}
+```
+
+```{r}
+data |> plot_brazil_city_map(breaks = breaks)
+```
+
+## Consumption of beans
+
+```{r}
+data <- get_data("Consumption - Beans")
+```
+
+```{r}
+#| eval: false
+#| inclued: false
+
+if (checkmate::test_tibble(data)) {
+  saveRDS(data, file.path(data_dir, "consumption_beans.rds"))
+}
+```
+
+```{r}
+data |> plot_brazil_city_map(breaks = breaks)
+```
+
+## Consumption of fruit
+
+```{r} 
+data <- get_data("Consumption - Fruits")
+```
+
+```{r}
+#| eval: false
+#| inclued: false
+
+if (checkmate::test_tibble(data)) {
+  saveRDS(data, file.path(data_dir, "consumption_fruits.rds"))
+}
+```
+
+```{r}
+data |> plot_brazil_city_map(breaks = breaks)
+```
+
+## Consumption of vegetables and greens
+
+```{r}
+data <- get_data("Consumption - Vegetables")
+```
+
+```{r}
+#| eval: false
+#| inclued: false
+
+if (checkmate::test_tibble(data)) {
+  saveRDS(data, file.path(data_dir, "consumption_vegetables.rds"))
+}
+```
+
+```{r}
+data |> plot_brazil_city_map(breaks = breaks)
+```
+
+## Consumption of ultraprocessed foods (UPF)
+
+```{r}
+data <- get_data("Consumption - UPFs")
+```
+
+```{r}
+#| eval: false
+#| inclued: false
+
+if (checkmate::test_tibble(data)) {
+  saveRDS(data, file.path(data_dir, "consumption_upfs.rds"))
+}
+```
+
+```{r}
+data |> plot_brazil_city_map(breaks = breaks)
+```
+
+## Consumption of sugary drinks
+
+```{r}
+data <- get_data("Comsumption - Sugary drinks")
+```
+
+```{r}
+#| eval: false
+#| inclued: false
+
+if (checkmate::test_tibble(data)) {
+  saveRDS(data, file.path(data_dir, "consumption_sugary_drinks.rds"))
+}
+```
+
+```{r}
+data |> plot_brazil_city_map(breaks = breaks)
+```
+
+<!-- ## References {.unnumbered} -->
+
+<!-- ::: {#refs} -->
+<!-- ::: -->
